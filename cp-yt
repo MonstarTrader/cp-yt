@@ -1,0 +1,1221 @@
+#!/usr/bin/env python3
+"""
+ytcr_gui — manual selection YouTube copyright remover
+====================================================
+Interactive tool:
+  - scrub video timeline
+  - mark audio time ranges to mutate (or all)
+  - draw video regions to mutate (or all)
+  - per-selection strength
+  - render
+
+Requires:
+    pip install numpy opencv-python pillow
+    ffmpeg + ffprobe on PATH
+
+Run:
+    python ytcr_gui.py
+"""
+
+import os
+import sys
+import json
+import shutil
+import tempfile
+import threading
+import subprocess
+import traceback
+from pathlib import Path
+from dataclasses import dataclass, field, asdict
+from typing import List, Optional, Tuple
+
+import numpy as np
+import cv2
+from PIL import Image, ImageTk
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+# ---------------------------------------------------------------------------
+# constants
+# ---------------------------------------------------------------------------
+
+PRESETS = {
+    "subtle":     dict(pitch=0.8, tempo=0.3, noise=-58, rotate=0.3,
+                       zoom=1.5, crop=2, gamma=0.01, bright=0.01, fps=0),
+    "balanced":   dict(pitch=1.8, tempo=0.7, noise=-52, rotate=0.7,
+                       zoom=2.5, crop=4, gamma=0.02, bright=0.02, fps=1),
+    "aggressive": dict(pitch=3.0, tempo=1.2, noise=-46, rotate=1.2,
+                       zoom=4.0, crop=6, gamma=0.03, bright=0.03, fps=2),
+}
+
+VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v"}
+
+
+# ---------------------------------------------------------------------------
+# data model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class AudioRange:
+    start: float
+    end: float
+    preset: str = "balanced"
+
+@dataclass
+class VideoRegion:
+    x: int
+    y: int
+    w: int
+    h: int
+    preset: str = "balanced"
+    start: float = 0.0
+    end: float = -1.0   # -1 = full duration
+
+@dataclass
+class Project:
+    input_path: str = ""
+    output_path: str = ""
+    audio_ranges: List[AudioRange] = field(default_factory=list)
+    video_regions: List[VideoRegion] = field(default_factory=list)
+    mutate_all_audio: bool = False
+    mutate_all_video: bool = False
+    all_audio_preset: str = "balanced"
+    all_video_preset: str = "balanced"
+
+    def to_json(self):
+        d = asdict(self)
+        return json.dumps(d, indent=2)
+
+    @classmethod
+    def from_json(cls, s):
+        d = json.loads(s)
+        p = cls(
+            input_path=d.get("input_path", ""),
+            output_path=d.get("output_path", ""),
+            mutate_all_audio=d.get("mutate_all_audio", False),
+            mutate_all_video=d.get("mutate_all_video", False),
+            all_audio_preset=d.get("all_audio_preset", "balanced"),
+            all_video_preset=d.get("all_video_preset", "balanced"),
+        )
+        for r in d.get("audio_ranges", []):
+            p.audio_ranges.append(AudioRange(**r))
+        for r in d.get("video_regions", []):
+            p.video_regions.append(VideoRegion(**r))
+        return p
+
+
+# ---------------------------------------------------------------------------
+# ffmpeg helpers
+# ---------------------------------------------------------------------------
+
+def ffmpeg(): return shutil.which("ffmpeg") or sys.exit("ffmpeg not found")
+def ffprobe(): return shutil.which("ffprobe") or sys.exit("ffprobe not found")
+
+
+def run(cmd, check=True):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"cmd failed: {' '.join(map(str, cmd))}\n{p.stderr[-3000:]}")
+    return p
+
+
+def probe_stream(path, stream=None, entries="format=duration"):
+    cmd = [ffprobe(), "-v", "error", "-of", "default=nw=1",
+           "-show_entries", entries]
+    if stream:
+        cmd += ["-select_streams", stream]
+    cmd += [str(path)]
+    out = subprocess.check_output(cmd, text=True)
+    d = {}
+    for line in out.strip().splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            d[k] = v
+    return d
+
+
+def video_info(path):
+    v = probe_stream(path, stream="v:0",
+                     entries="stream=width,height,r_frame_rate,nb_frames,duration")
+    w = int(v.get("width", 0))
+    h = int(v.get("height", 0))
+    fr = v.get("r_frame_rate", "30/1")
+    try:
+        num, den = fr.split("/")
+        fps = float(num) / float(den)
+    except Exception:
+        fps = 30.0
+    dur = float(v.get("duration") or
+                probe_stream(path).get("duration", 0.0))
+    return {"width": w, "height": h, "fps": fps, "duration": dur}
+
+
+def extract_audio_wav(video, wav_path, sr=48000):
+    run([ffmpeg(), "-y", "-i", str(video),
+         "-vn", "-ac", "2", "-ar", str(sr),
+         "-acodec", "pcm_s16le", str(wav_path)])
+
+
+def read_frame(path, t, target_w=None, target_h=None):
+    cap = cv2.VideoCapture(str(path))
+    cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return None
+    if target_w and target_h:
+        frame = cv2.resize(frame, (target_w, target_h),
+                           interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+# ---------------------------------------------------------------------------
+# audio mutation core (mirrors ytcr.py)
+# ---------------------------------------------------------------------------
+
+def load_wav(path):
+    import wave
+    with wave.open(str(path), "rb") as w:
+        sr = w.getframerate()
+        n = w.getnframes()
+        ch = w.getnchannels()
+        raw = w.readframes(n)
+    data = np.frombuffer(raw, dtype=np.int16).reshape(-1, ch)
+    return data.astype(np.float32) / 32768.0, sr
+
+
+def save_wav(path, data, sr):
+    import wave
+    d = np.clip(data, -1.0, 1.0)
+    pcm = (d * 32767.0).astype(np.int16)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(pcm.shape[1])
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(pcm.tobytes())
+
+
+def _stft(x, n_fft=2048, hop=512):
+    win = np.hanning(n_fft).astype(np.float32)
+    n = 1 + (len(x) - n_fft) // hop
+    frames = np.empty((n, n_fft), dtype=np.complex64)
+    for i in range(n):
+        seg = x[i * hop: i * hop + n_fft] * win
+        frames[i] = np.fft.rfft(seg, n=n_fft)
+    return frames, win
+
+
+def _istft(frames, win, hop, length):
+    n_fft = (frames.shape[1] - 1) * 2
+    out = np.zeros(length, dtype=np.float32)
+    norm = np.zeros(length, dtype=np.float32)
+    wsum = win ** 2
+    for i in range(frames.shape[0]):
+        seg = np.fft.irfft(frames[i], n=n_fft).astype(np.float32) * win
+        s = i * hop
+        if s + n_fft > length:
+            break
+        out[s: s + n_fft] += seg
+        norm[s: s + n_fft] += wsum
+    norm[norm < 1e-8] = 1.0
+    return out / norm
+
+
+def _eq_notch(x, sr, centers=(400, 1000, 2500, 6000), depth_db=-3.0, q=1.2):
+    frames, win = _stft(x)
+    freqs = np.fft.rfftfreq(2048, 1.0 / sr)
+    gain = np.ones_like(freqs, dtype=np.float32)
+    for c in centers:
+        bw = c / q
+        mask = np.exp(-0.5 * ((freqs - c) / (bw / 2.0)) ** 2)
+        gain *= 10 ** ((depth_db / 20.0) * mask)
+    frames *= gain[None, :]
+    return _istft(frames, win, 512, len(x))
+
+
+def _resample(data, sr_in, sr_out):
+    if sr_in == sr_out:
+        return data
+    n_out = int(len(data) * sr_out / sr_in)
+    idx = np.linspace(0, len(data) - 1, n_out)
+    out = np.empty((n_out, data.shape[1]), dtype=np.float32)
+    for ch in range(data.shape[1]):
+        out[:, ch] = np.interp(idx, np.arange(len(data)), data[:, ch])
+    return out
+
+
+def _pitch_shift_mono(x, sr, semitones):
+    if abs(semitones) < 1e-4:
+        return x
+    rate = 2 ** (semitones / 12.0)
+    n_fft, hop_a = 2048, 512
+    hop_s = int(round(hop_a / rate))
+    frames, win = _stft(x, n_fft, hop_a)
+    mag = np.abs(frames)
+    phase = np.angle(frames)
+    omega0 = 2 * np.pi * hop_a * np.fft.rfftfreq(n_fft, 1.0 / sr)[None, :]
+    dphi = np.diff(phase, axis=0, prepend=phase[:1])
+    dphi = np.mod(dphi - omega0 + np.pi, 2 * np.pi) - np.pi
+    omega = omega0 + dphi
+    out_len = int(len(x) / rate) + n_fft
+    out = np.zeros(out_len, dtype=np.float32)
+    norm = np.zeros(out_len, dtype=np.float32)
+    wsum = win ** 2
+    acc = phase[:1].copy()
+    for i in range(frames.shape[0]):
+        if i > 0:
+            acc = acc + omega[i]
+        seg = np.fft.irfft(mag[i] * np.exp(1j * acc), n=n_fft).astype(np.float32) * win
+        s = i * hop_s
+        if s + n_fft > out_len:
+            break
+        out[s: s + n_fft] += seg
+        norm[s: s + n_fft] += wsum
+    norm[norm < 1e-8] = 1.0
+    return (out / norm)[:out_len]
+
+
+def _time_stretch_mono(x, sr, rate):
+    if abs(rate - 1.0) < 1e-4:
+        return x
+    n_fft, hop_a = 2048, 512
+    hop_s = int(round(hop_a / rate))
+    frames, win = _stft(x, n_fft, hop_a)
+    mag = np.abs(frames)
+    phase = np.angle(frames)
+    omega0 = 2 * np.pi * hop_a * np.fft.rfftfreq(n_fft, 1.0 / sr)[None, :]
+    dphi = np.diff(phase, axis=0, prepend=phase[:1])
+    dphi = np.mod(dphi - omega0 + np.pi, 2 * np.pi) - np.pi
+    omega = omega0 + dphi
+    out_len = int(len(x) / rate) + n_fft
+    out = np.zeros(out_len, dtype=np.float32)
+    norm = np.zeros(out_len, dtype=np.float32)
+    wsum = win ** 2
+    acc = phase[:1].copy()
+    for i in range(frames.shape[0]):
+        if i > 0:
+            acc = acc + omega[i]
+        seg = np.fft.irfft(mag[i] * np.exp(1j * acc), n=n_fft).astype(np.float32) * win
+        s = i * hop_s
+        if s + n_fft > out_len:
+            break
+        out[s: s + n_fft] += seg
+        norm[s: s + n_fft] += wsum
+    norm[norm < 1e-8] = 1.0
+    return (out / norm)[:out_len]
+
+
+def mutate_audio_segment(seg, sr, preset_name):
+    """seg: float32 (samples, channels). returns mutated same-shape block."""
+    preset = PRESETS[preset_name]
+    out_ch = []
+    # micro stereo phase
+    if seg.shape[1] == 2:
+        d = int(sr * 0.15 / 1000.0)
+        if d > 0:
+            s2 = seg.copy()
+            s2[d:, 1] = seg[:-d, 1]
+            s2[:d, 1] = seg[:d, 1]
+            seg = s2
+    for ch in range(seg.shape[1]):
+        x = seg[:, ch]
+        x = _eq_notch(x, sr)
+        x = _pitch_shift_mono(x, sr, preset["pitch"] * 0.5)
+        x = _time_stretch_mono(x, sr, 1.0 + preset["tempo"] / 100.0)
+        out_ch.append(x)
+    L = min(len(c) for c in out_ch)
+    out = np.stack([c[:L] for c in out_ch], axis=1)
+    out = _resample(out, sr, 44100)
+    out = _resample(out, 44100, sr)
+    amp = 10 ** (preset["noise"] / 20.0)
+    noise = np.random.randn(*out.shape).astype(np.float32) * amp
+    k = np.ones(8, dtype=np.float32) / 8.0
+    for ch in range(noise.shape[1]):
+        noise[:, ch] = np.convolve(noise[:, ch], k, mode="same")
+    out = out + noise
+    # resample back to seg length so caller can splice it in
+    if len(out) != len(seg):
+        idx = np.linspace(0, len(out) - 1, len(seg))
+        out2 = np.empty((len(seg), out.shape[1]), dtype=np.float32)
+        for ch in range(out.shape[1]):
+            out2[:, ch] = np.interp(idx, np.arange(len(out)), out[:, ch])
+        out = out2
+    return np.clip(out, -1.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
+# video filtergraph builder
+# ---------------------------------------------------------------------------
+
+def build_video_filtergraph(regions, full_frame_preset, width, height, duration):
+    """
+    Returns (filter_complex_string, output_label).
+    Regions = list of VideoRegion (0<=start<=end<=duration).
+    full_frame_preset: preset name or None.
+    Time-bounded regions via enable='between(t,s,e)'.
+    """
+    parts = []
+    labels = []
+    # start with input
+    if full_frame_preset is None and not regions:
+        return None, "[0:v]"
+    p = PRESETS[full_frame_preset] if full_frame_preset else None
+
+    # base stream = input
+    parts.append("[0:v]split=%d[base0]" % (len(regions) + 1))
+    base_labels = [f"[base{i}]" for i in range(len(regions) + 1)]
+    # apply full-frame if requested on base0
+    chain = "[base0]"
+    if full_frame_preset:
+        vf = _full_frame_chain(p, width, height)
+        parts.append(f"[base0]{vf}[vfull]")
+        chain = "[vfull]"
+    else:
+        parts.append("[base0]null[vfull]")
+        chain = "[vfull]"
+
+    # now overlay each region's mutated crop onto vfull
+    for i, r in enumerate(regions):
+        pres = PRESETS[r.preset]
+        zoom = 1.0 + pres["zoom"] / 100.0
+        zw = int(r.w * zoom) // 2 * 2
+        zh = int(r.h * zoom) // 2 * 2
+        cx = (zw - r.w) // 2
+        cy = (zh - r.h) // 2
+        rotate = pres["rotate"] * np.pi / 180.0
+        gamma = 1.0 + pres["gamma"]
+        bright = pres["bright"]
+        enable = ""
+        if r.end > r.start >= 0:
+            enable = f":enable='between(t,{r.start:.3f},{r.end:.3f})'"
+
+        reg_in = f"[base{i+1}]"
+        # crop region -> mutate -> overlay
+        mutate_chain = (
+            f"crop={r.w}:{r.h}:{r.x}:{r.y},"
+            f"scale={zw}:{zh}:flags=lanczos,"
+            f"crop={r.w}:{r.h}:{cx}:{cy},"
+            f"rotate={rotate}:ow={r.w}:oh={r.h}:c=black@0,"
+            f"eq=gamma={gamma:.4f}:brightness={bright:.4f}"
+        )
+        parts.append(f"{reg_in}{mutate_chain}[reg{i}]")
+        # overlay onto current chain
+        ovl_out = f"[v{i}]"
+        parts.append(
+            f"{chain}[reg{i}]overlay={r.x}:{r.y}{enable}{ovl_out}"
+        )
+        chain = ovl_out
+
+    # final
+    return ";".join(parts), chain
+
+
+def _full_frame_chain(p, w, h):
+    zoom = 1.0 + p["zoom"] / 100.0
+    crop = p["crop"]
+    rotate = p["rotate"] * np.pi / 180.0
+    zw = int(w * zoom) // 2 * 2
+    zh = int(h * zoom) // 2 * 2
+    cx = (zw - w) // 2
+    cy = (zh - h) // 2
+    cw = (w - 2 * crop) // 2 * 2
+    ch = (h - 2 * crop) // 2 * 2
+    gamma = 1.0 + p["gamma"]
+    bright = p["bright"]
+    fps = f",fps=fps={30 + p['fps']*0.01}:round=up" if p["fps"] > 0 else ""
+    return (
+        f"scale={zw}:{zh}:flags=lanczos,"
+        f"crop={w}:{h}:{cx}:{cy},"
+        f"rotate={rotate}:ow={w}:oh={h}:c=black@0,"
+        f"crop={cw}:{ch}:{(w-cw)//2}:{(h-ch)//2},"
+        f"scale={w}:{h}:flags=lanczos,"
+        f"eq=gamma={gamma:.4f}:brightness={bright:.4f}"
+        f"{fps}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# render pipeline
+# ---------------------------------------------------------------------------
+
+def render_project(project: Project, progress_cb=None):
+    input_path = Path(project.input_path)
+    output_path = Path(project.output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not input_path.exists():
+        raise RuntimeError(f"input not found: {input_path}")
+
+    info = video_info(input_path)
+    duration = info["duration"]
+    width, height = info["width"], info["height"]
+
+    with tempfile.TemporaryDirectory(prefix="ytcr_gui_") as td:
+        td = Path(td)
+
+        # ---- AUDIO STAGE ------------------------------------------------
+        if progress_cb: progress_cb("audio: decode")
+        wav_in = td / "a_in.wav"
+        wav_out = td / "a_out.wav"
+        extract_audio_wav(input_path, wav_in, sr=48000)
+        data, sr = load_wav(wav_in)
+
+        if project.mutate_all_audio:
+            if progress_cb: progress_cb("audio: mutate all")
+            data = mutate_audio_segment(data, sr, project.all_audio_preset)
+        else:
+            for i, r in enumerate(project.audio_ranges):
+                if progress_cb: progress_cb(f"audio: range {i+1}/{len(project.audio_ranges)}")
+                s = max(0, int(r.start * sr))
+                e = min(len(data), int(r.end * sr))
+                if e <= s:
+                    continue
+                seg = data[s:e]
+                # preserve original stereo width by mutating each ch
+                mut = mutate_audio_segment(seg, sr, r.preset)
+                data[s:e] = mut
+
+        save_wav(wav_out, data, sr)
+
+        # ---- VIDEO STAGE ------------------------------------------------
+        if progress_cb: progress_cb("video: build filtergraph")
+        regions = [r for r in project.video_regions
+                   if 0 <= r.x and 0 <= r.y and r.w > 0 and r.h > 0]
+        fg, out_label = build_video_filtergraph(
+            regions,
+            project.all_video_preset if project.mutate_all_video else None,
+            width, height, duration
+        )
+
+        vid_mut = td / "v_mut.mp4"
+        if fg is None:
+            # no video changes; copy video stream
+            run([ffmpeg(), "-y", "-i", str(input_path),
+                 "-an", "-c:v", "copy", str(vid_mut)])
+        else:
+            cmd = [ffmpeg(), "-y", "-i", str(input_path),
+                   "-filter_complex", fg,
+                   "-map", out_label.lstrip("[").rstrip("]"),
+                   "-an", "-c:v", "libx264", "-preset", "slow",
+                   "-crf", "20", "-pix_fmt", "yuv420p",
+                   str(vid_mut)]
+            if progress_cb: progress_cb("video: encode")
+            run(cmd)
+
+        # ---- MUX --------------------------------------------------------
+        if progress_cb: progress_cb("mux")
+        run([ffmpeg(), "-y",
+             "-i", str(vid_mut),
+             "-i", str(wav_out),
+             "-c:v", "copy",
+             "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
+             "-shortest", "-movflags", "+faststart",
+             str(output_path)])
+
+    if progress_cb: progress_cb("done")
+    return str(output_path)
+
+
+# ---------------------------------------------------------------------------
+# GUI
+# ---------------------------------------------------------------------------
+
+class WaveformCanvas(tk.Canvas):
+    """Displays an audio waveform thumbnail with draggable selection ranges."""
+
+    def __init__(self, master, on_range_added=None, **kw):
+        super().__init__(master, bg="#1a1a1a", height=120,
+                         highlightthickness=0, **kw)
+        self.wave = None       # np array mono, downsampled
+        self.sr_disp = None
+        self.duration = 0.0
+        self.on_range_added = on_range_added
+        self.ranges = []       # list of (start, end, color)
+        self._drag_start = None
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def set_waveform(self, mono, sr):
+        self.wave = mono
+        self.sr_disp = sr
+        self.duration = len(mono) / sr if sr else 0.0
+        self.redraw()
+
+    def add_range(self, start, end, color="#3aa0ff"):
+        self.ranges.append((start, end, color))
+        self.redraw()
+
+    def clear_ranges(self):
+        self.ranges.clear()
+        self.redraw()
+
+    def _x_to_t(self, x):
+        w = self.winfo_width() or 1
+        return max(0.0, min(self.duration, x / w * self.duration))
+
+    def _t_to_x(self, t):
+        w = self.winfo_width() or 1
+        return int(t / self.duration * w) if self.duration else 0
+
+    def _on_press(self, e):
+        self._drag_start = self._x_to_t(e.x)
+
+    def _on_drag(self, e):
+        if self._drag_start is None:
+            return
+        self.redraw(temp_end=self._x_to_t(e.x))
+
+    def _on_release(self, e):
+        if self._drag_start is None:
+            return
+        end = self._x_to_t(e.x)
+        s, en = sorted((self._drag_start, end))
+        self._drag_start = None
+        if en - s > 0.05:
+            if self.on_range_added:
+                self.on_range_added(s, en)
+        self.redraw()
+
+    def redraw(self, temp_end=None):
+        self.delete("all")
+        w = self.winfo_width() or 1
+        h = self.winfo_height() or 1
+        # baseline
+        self.create_line(0, h // 2, w, h // 2, fill="#333")
+        # waveform
+        if self.wave is not None and len(self.wave) > 0:
+            n = w
+            step = max(1, len(self.wave) // n)
+            ys = []
+            xs = []
+            for i in range(n):
+                seg = self.wave[i * step:(i + 1) * step]
+                if len(seg) == 0:
+                    continue
+                amp = float(np.max(np.abs(seg)))
+                xs.append(i)
+                ys.append(amp)
+            for x, a in zip(xs, ys):
+                y1 = h // 2 - int(a * (h // 2 - 4))
+                y2 = h // 2 + int(a * (h // 2 - 4))
+                self.create_line(x, y1, x, y2, fill="#5a5a5a")
+        # ranges
+        for (s, e, c) in self.ranges:
+            x1 = self._t_to_x(s)
+            x2 = self._t_to_x(e)
+            self.create_rectangle(x1, 0, x2, h, fill=c, stipple="gray25",
+                                  outline=c)
+        # temp drag
+        if self._drag_start is not None and temp_end is not None:
+            s, en = sorted((self._drag_start, temp_end))
+            x1 = self._t_to_x(s)
+            x2 = self._t_to_x(en)
+            self.create_rectangle(x1, 0, x2, h, fill="#3aa0ff",
+                                  stipple="gray50", outline="#3aa0ff")
+
+
+class VideoCanvas(tk.Canvas):
+    """Displays a video frame; lets user draw selection rectangles."""
+
+    def __init__(self, master, on_region_added=None, **kw):
+        super().__init__(master, bg="#000", highlightthickness=0, **kw)
+        self.img_ref = None
+        self.frame_bgr = None
+        self.video_size = (0, 0)     # original video px
+        self.disp_size = (0, 0)      # displayed size
+        self.offset = (0, 0)
+        self.on_region_added = on_region_added
+        self.regions = []            # list of (x,y,w,h,color)
+        self._drag = None
+        self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+
+    def set_frame(self, rgb_frame):
+        self.frame_bgr = rgb_frame
+        self.video_size = (rgb_frame.shape[1], rgb_frame.shape[0])
+        self.redraw()
+
+    def add_region(self, x, y, w, h, color="#3aa0ff"):
+        self.regions.append((x, y, w, h, color))
+        self.redraw()
+
+    def clear_regions(self):
+        self.regions.clear()
+        self.redraw()
+
+    def _compute_fit(self):
+        cw = self.winfo_width() or 1
+        ch = self.winfo_height() or 1
+        vw, vh = self.video_size
+        if not vw or not vh:
+            return 1.0, 0, 0
+        scale = min(cw / vw, ch / vh)
+        dw = int(vw * scale)
+        dh = int(vh * scale)
+        ox = (cw - dw) // 2
+        oy = (ch - dh) // 2
+        self.disp_size = (dw, dh)
+        self.offset = (ox, oy)
+        return scale, ox, oy
+
+    def _canvas_to_video(self, x, y):
+        scale, ox, oy = self._compute_fit()
+        vx = int((x - ox) / scale) if scale else 0
+        vy = int((y - oy) / scale) if scale else 0
+        vw, vh = self.video_size
+        vx = max(0, min(vw, vx))
+        vy = max(0, min(vh, vy))
+        return vx, vy
+
+    def _on_press(self, e):
+        self._drag = self._canvas_to_video(e.x, e.y)
+
+    def _on_drag(self, e):
+        if not self._drag:
+            return
+        cur = self._canvas_to_video(e.x, e.y)
+        self.redraw(temp_rect=(self._drag, cur))
+
+    def _on_release(self, e):
+        if not self._drag:
+            return
+        cur = self._canvas_to_video(e.x, e.y)
+        x0, y0 = self._drag
+        x1, y1 = cur
+        self._drag = None
+        x, y = min(x0, x1), min(y0, y1)
+        w, h = abs(x1 - x0), abs(y1 - y0)
+        if w > 8 and h > 8:
+            if self.on_region_added:
+                self.on_region_added(x, y, w, h)
+        self.redraw()
+
+    def redraw(self, temp_rect=None):
+        self.delete("all")
+        cw = self.winfo_width() or 1
+        ch = self.winfo_height() or 1
+        if self.frame_bgr is None:
+            self.create_text(cw // 2, ch // 2, fill="#666",
+                             text="load a video to preview")
+            return
+        scale, ox, oy = self._compute_fit()
+        dw, dh = self.disp_size
+        pil = Image.fromarray(self.frame_bgr)
+        if (dw, dh) != (pil.width, pil.height):
+            pil = pil.resize((dw, dh), Image.LANCZOS)
+        self.img_ref = ImageTk.PhotoImage(pil)
+        self.create_image(ox, oy, anchor="nw", image=self.img_ref)
+        # regions
+        for (x, y, w, h, c) in self.regions:
+            cx = ox + int(x * scale)
+            cy = oy + int(y * scale)
+            cw_ = int(w * scale)
+            ch_ = int(h * scale)
+            self.create_rectangle(cx, cy, cx + cw_, cy + ch_,
+                                  outline=c, width=2)
+        if temp_rect:
+            (x0, y0), (x1, y1) = temp_rect
+            cx = ox + int(min(x0, x1) * scale)
+            cy = oy + int(min(y0, y1) * scale)
+            cw_ = int(abs(x1 - x0) * scale)
+            ch_ = int(abs(y1 - y0) * scale)
+            self.create_rectangle(cx, cy, cx + cw_, cy + ch_,
+                                  outline="#3aa0ff", width=2, dash=(4, 2))
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ytcr_gui — manual copyright remover")
+        self.geometry("1280x820")
+        self.configure(bg="#111")
+
+        self.project = Project()
+        self.info = None
+        self.audio_data = None    # full float32 (samples, ch) at 48k
+        self.audio_sr = 48000
+        self.audio_thumb = None   # downsampled mono for display
+
+        self._build_menu()
+        self._build_ui()
+        self._bind_keys()
+
+    # ---------- UI ------------------------------------------------
+
+    def _build_menu(self):
+        m = tk.Menu(self)
+        filem = tk.Menu(m, tearoff=0)
+        filem.add_command(label="Open video...", command=self.open_video,
+                          accelerator="Ctrl+O")
+        filem.add_command(label="Set output...", command=self.set_output,
+                          accelerator="Ctrl+S")
+        filem.add_separator()
+        filem.add_command(label="Save project...", command=self.save_project)
+        filem.add_command(label="Load project...", command=self.load_project)
+        filem.add_separator()
+        filem.add_command(label="Exit", command=self.destroy)
+        m.add_cascade(label="File", menu=filem)
+        self.config(menu=m)
+
+    def _build_ui(self):
+        # top: file bar
+        top = tk.Frame(self, bg="#111")
+        top.pack(side="top", fill="x", padx=8, pady=6)
+        tk.Button(top, text="Open video", command=self.open_video,
+                  bg="#222", fg="#eee", relief="flat",
+                  activebackground="#333").pack(side="left", padx=2)
+        tk.Button(top, text="Set output", command=self.set_output,
+                  bg="#222", fg="#eee", relief="flat",
+                  activebackground="#333").pack(side="left", padx=2)
+        self.lbl_input = tk.Label(top, text="no video", fg="#888", bg="#111")
+        self.lbl_input.pack(side="left", padx=12)
+        self.lbl_output = tk.Label(top, text="", fg="#888", bg="#111")
+        self.lbl_output.pack(side="right", padx=12)
+
+        # main split: preview (left) + controls (right)
+        main = tk.Frame(self, bg="#111")
+        main.pack(fill="both", expand=True, padx=8)
+
+        left = tk.Frame(main, bg="#111")
+        left.pack(side="left", fill="both", expand=True)
+
+        # video preview
+        self.video_canvas = VideoCanvas(
+            left, on_region_added=self._on_video_region_drawn
+        )
+        self.video_canvas.pack(fill="both", expand=True)
+
+        # scrubber
+        scrub = tk.Frame(left, bg="#111")
+        scrub.pack(fill="x", pady=4)
+        self.slider = tk.Scale(
+            scrub, from_=0, to=1000, orient="horizontal",
+            bg="#111", fg="#ccc", troughcolor="#222",
+            highlightthickness=0, showvalue=False,
+            command=self._on_scrub
+        )
+        self.slider.pack(side="left", fill="x", expand=True)
+        self.lbl_time = tk.Label(scrub, text="0.00 / 0.00",
+                                 fg="#aaa", bg="#111", width=16)
+        self.lbl_time.pack(side="right")
+
+        # waveform
+        wave_frame = tk.LabelFrame(left, text="audio timeline (drag to select)",
+                                   bg="#111", fg="#888",
+                                   bd=0, labelanchor="nw")
+        wave_frame.pack(fill="x", pady=(6, 0))
+        self.wave_canvas = WaveformCanvas(
+            wave_frame, on_range_added=self._on_audio_range_drawn,
+            height=120
+        )
+        self.wave_canvas.pack(fill="x")
+
+        # right panel
+        right = tk.Frame(main, bg="#111", width=380)
+        right.pack(side="right", fill="y", padx=(8, 0))
+        right.pack_propagate(False)
+
+        # --- video regions list
+        vr = tk.LabelFrame(right, text="video regions",
+                           bg="#111", fg="#ccc", bd=1)
+        vr.pack(fill="both", expand=True, pady=4)
+        self.vr_list = tk.Listbox(vr, bg="#1a1a1a", fg="#ddd",
+                                  selectbackground="#333",
+                                  highlightthickness=0)
+        self.vr_list.pack(fill="both", expand=True, side="left")
+        self.vr_list.bind("<Double-Button-1>", self._edit_video_region)
+        vr_scroll = tk.Scrollbar(vr, command=self.vr_list.yview)
+        vr_scroll.pack(side="right", fill="y")
+        self.vr_list.config(yscrollcommand=vr_scroll.set)
+
+        vr_btns = tk.Frame(right, bg="#111")
+        vr_btns.pack(fill="x")
+        tk.Button(vr_btns, text="delete", command=self._delete_video_region,
+                  bg="#222", fg="#eee", relief="flat").pack(side="left", padx=2)
+        tk.Button(vr_btns, text="clear", command=self._clear_video_regions,
+                  bg="#222", fg="#eee", relief="flat").pack(side="left", padx=2)
+
+        # --- audio ranges list
+        ar = tk.LabelFrame(right, text="audio ranges",
+                           bg="#111", fg="#ccc", bd=1)
+        ar.pack(fill="both", expand=True, pady=4)
+        self.ar_list = tk.Listbox(ar, bg="#1a1a1a", fg="#ddd",
+                                  selectbackground="#333",
+                                  highlightthickness=0)
+        self.ar_list.pack(fill="both", expand=True, side="left")
+        self.ar_list.bind("<Double-Button-1>", self._edit_audio_range)
+        ar_scroll = tk.Scrollbar(ar, command=self.ar_list.yview)
+        ar_scroll.pack(side="right", fill="y")
+        self.ar_list.config(yscrollcommand=ar_scroll.set)
+
+        ar_btns = tk.Frame(right, bg="#111")
+        ar_btns.pack(fill="x")
+        tk.Button(ar_btns, text="delete", command=self._delete_audio_range,
+                  bg="#222", fg="#eee", relief="flat").pack(side="left", padx=2)
+        tk.Button(ar_btns, text="clear", command=self._clear_audio_ranges,
+                  bg="#222", fg="#eee", relief="flat").pack(side="left", padx=2)
+
+        # --- global toggles
+        gl = tk.LabelFrame(right, text="global",
+                           bg="#111", fg="#ccc", bd=1)
+        gl.pack(fill="x", pady=4)
+
+        self.var_all_audio = tk.BooleanVar(value=False)
+        self.var_all_video = tk.BooleanVar(value=False)
+        self.var_audio_preset = tk.StringVar(value="balanced")
+        self.var_video_preset = tk.StringVar(value="balanced")
+
+        tk.Checkbutton(gl, text="mutate ALL audio",
+                       variable=self.var_all_audio,
+                       bg="#111", fg="#ddd", selectcolor="#222",
+                       activebackground="#111",
+                       command=self._sync_all_flags).pack(anchor="w", padx=6)
+        tk.OptionMenu(gl, self.var_audio_preset, *PRESETS.keys()).pack(
+            anchor="w", padx=24)
+
+        tk.Checkbutton(gl, text="mutate ALL video frames",
+                       variable=self.var_all_video,
+                       bg="#111", fg="#ddd", selectcolor="#222",
+                       activebackground="#111",
+                       command=self._sync_all_flags).pack(anchor="w", padx=6)
+        tk.OptionMenu(gl, self.var_video_preset, *PRESETS.keys()).pack(
+            anchor="w", padx=24)
+
+        # --- render
+        rr = tk.Frame(right, bg="#111")
+        rr.pack(fill="x", pady=8)
+        tk.Button(rr, text="RENDER", command=self.render,
+                  bg="#2b5fd9", fg="#fff", relief="flat",
+                  font=("TkDefaultFont", 11, "bold")).pack(fill="x")
+
+        # status
+        self.status = tk.Label(right, text="ready", fg="#888",
+                               bg="#111", anchor="w", wraplength=360)
+        self.status.pack(fill="x", pady=4)
+
+    def _bind_keys(self):
+        self.bind("<Control-o>", lambda e: self.open_video())
+        self.bind("<Control-s>", lambda e: self.set_output())
+        self.bind("<Left>", lambda e: self._step_scrub(-0.5))
+        self.bind("<Right>", lambda e: self._step_scrub(0.5))
+        self.bind("<space>", lambda e: self._step_scrub(0.0))
+
+    # ---------- project actions -----------------------------------
+
+    def open_video(self):
+        p = filedialog.askopenfilename(
+            filetypes=[("video", " ".join(f"*{e}" for e in VIDEO_EXTS)),
+                       ("all", "*.*")]
+        )
+        if not p:
+            return
+        self.project.input_path = p
+        self.lbl_input.config(text=Path(p).name)
+        if not self.project.output_path:
+            op = str(Path(p).with_name(Path(p).stem + "__ytcr" + Path(p).suffix))
+            self.project.output_path = op
+            self.lbl_output.config(text=Path(op).name)
+
+        self._load_media()
+
+    def set_output(self):
+        if not self.project.input_path:
+            messagebox.showinfo("no input", "open a video first")
+            return
+        p = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            initialfile=Path(self.project.input_path).stem + "__ytcr.mp4",
+            filetypes=[("mp4", "*.mp4"), ("mkv", "*.mkv")]
+        )
+        if not p:
+            return
+        self.project.output_path = p
+        self.lbl_output.config(text=Path(p).name)
+
+    def _load_media(self):
+        path = self.project.input_path
+        self.status.config(text="loading media...")
+        self.update_idletasks()
+        try:
+            self.info = video_info(path)
+        except Exception as e:
+            messagebox.showerror("probe failed", str(e))
+            return
+        self.slider.config(to=int(self.info["duration"] * 1000))
+        self.lbl_time.config(
+            text=f"0.00 / {self.info['duration']:.2f}"
+        )
+        # audio thumbnail
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                wav = Path(td) / "a.wav"
+                extract_audio_wav(path, wav, sr=16000)
+                d, sr = load_wav(wav)
+                mono = d.mean(axis=1)
+                # downsample thumbnail to ~4000 bins
+                target = 4000
+                if len(mono) > target:
+                    step = len(mono) // target
+                    mono = np.array([
+                        float(np.max(np.abs(mono[i*step:(i+1)*step])))
+                        for i in range(target)
+                    ], dtype=np.float32)
+                    # re-add sign so canvas has shape — use raw here
+                self.audio_thumb = mono
+                self.wave_canvas.set_waveform(self.audio_thumb,
+                                              sr=sr * max(1, step if len(d) > target else 1))
+        except Exception as e:
+            print("audio preview failed:", e)
+        # first frame
+        self._update_frame(0.0)
+        self.status.config(text="ready")
+
+    def _update_frame(self, t):
+        if not self.info:
+            return
+        cw = max(64, self.video_canvas.winfo_width())
+        ch = max(64, self.video_canvas.winfo_height())
+        try:
+            frame = read_frame(self.project.input_path, t,
+                               target_w=cw, target_h=ch)
+        except Exception as e:
+            print("frame read failed:", e)
+            frame = None
+        if frame is not None:
+            self.video_canvas.set_frame(frame)
+        self.lbl_time.config(text=f"{t:.2f} / {self.info['duration']:.2f}")
+
+    def _on_scrub(self, value):
+        t = float(value) / 1000.0
+        self._update_frame(t)
+
+    def _step_scrub(self, delta):
+        cur = self.slider.get() / 1000.0
+        t = max(0.0, min(self.info["duration"] if self.info else 0.0,
+                         cur + delta))
+        self.slider.set(int(t * 1000))
+
+    # ---------- selection callbacks -------------------------------
+
+    def _on_audio_range_drawn(self, start, end):
+        preset = self.var_audio_preset.get()
+        r = AudioRange(start=start, end=end, preset=preset)
+        self.project.audio_ranges.append(r)
+        color = {"subtle": "#3aa0ff",
+                 "balanced": "#ffb03a",
+                 "aggressive": "#ff4a4a"}[preset]
+        self.wave_canvas.add_range(start, end, color)
+        self.ar_list.insert("end",
+                            f"[{start:.2f} - {end:.2f}]  {preset}")
+
+    def _on_video_region_drawn(self, x, y, w, h):
+        preset = self.var_video_preset.get()
+        r = VideoRegion(x=x, y=y, w=w, h=h, preset=preset)
+        self.project.video_regions.append(r)
+        color = {"subtle": "#3aa0ff",
+                 "balanced": "#ffb03a",
+                 "aggressive": "#ff4a4a"}[preset]
+        self.video_canvas.add_region(x, y, w, h, color)
+        self.vr_list.insert("end",
+                            f"({x},{y}) {w}x{h}  {preset}")
+
+    # ---------- list operations -----------------------------------
+
+    def _edit_audio_range(self, _evt):
+        sel = self.ar_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        r = self.project.audio_ranges[i]
+        dlg = PresetDialog(self, current=r.preset,
+                           label=f"range {r.start:.2f}-{r.end:.2f}")
+        if dlg.result:
+            r.preset = dlg.result
+            self.ar_list.delete(i)
+            self.ar_list.insert(i,
+                                f"[{r.start:.2f} - {r.end:.2f}]  {r.preset}")
+            # recolor waveform
+            self.wave_canvas.ranges[i] = (
+                r.start, r.end,
+                {"subtle": "#3aa0ff", "balanced": "#ffb03a",
+                 "aggressive": "#ff4a4a"}[r.preset]
+            )
+            self.wave_canvas.redraw()
+
+    def _delete_audio_range(self):
+        sel = self.ar_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        del self.project.audio_ranges[i]
+        del self.wave_canvas.ranges[i]
+        self.ar_list.delete(i)
+        self.wave_canvas.redraw()
+
+    def _clear_audio_ranges(self):
+        self.project.audio_ranges.clear()
+        self.wave_canvas.clear_ranges()
+        self.ar_list.delete(0, "end")
+
+    def _edit_video_region(self, _evt):
+        sel = self.vr_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        r = self.project.video_regions[i]
+        dlg = PresetDialog(self, current=r.preset,
+                           label=f"region {r.w}x{r.h} @ ({r.x},{r.y})")
+        if dlg.result:
+            r.preset = dlg.result
+            self.vr_list.delete(i)
+            self.vr_list.insert(i,
+                                f"({r.x},{r.y}) {r.w}x{r.h}  {r.preset}")
+            self.video_canvas.regions[i] = (
+                r.x, r.y, r.w, r.h,
+                {"subtle": "#3aa0ff", "balanced": "#ffb03a",
+                 "aggressive": "#ff4a4a"}[r.preset]
+            )
+            self.video_canvas.redraw()
+
+    def _delete_video_region(self):
+        sel = self.vr_list.curselection()
+        if not sel:
+            return
+        i = sel[0]
+        del self.project.video_regions[i]
+        del self.video_canvas.regions[i]
+        self.vr_list.delete(i)
+        self.video_canvas.redraw()
+
+    def _clear_video_regions(self):
+        self.project.video_regions.clear()
+        self.video_canvas.clear_regions()
+        self.vr_list.delete(0, "end")
+
+    def _sync_all_flags(self):
+        self.project.mutate_all_audio = self.var_all_audio.get()
+        self.project.mutate_all_video = self.var_all_video.get()
+        self.project.all_audio_preset = self.var_audio_preset.get()
+        self.project.all_video_preset = self.var_video_preset.get()
+
+    # ---------- save/load ----------------------------------------
+
+    def save_project(self):
+        p = filedialog.asksaveasfilename(defaultextension=".ytcr.json",
+                                          filetypes=[("ytcr project", "*.json")])
+        if not p:
+            return
+        self._sync_all_flags()
+        Path(p).write_text(self.project.to_json())
+        self.status.config(text=f"saved: {p}")
+
+    def load_project(self):
+        p = filedialog.askopenfilename(filetypes=[("ytcr project", "*.json")])
+        if not p:
+            return
+        try:
+            self.project = Project.from_json(Path(p).read_text())
+        except Exception as e:
+            messagebox.showerror("load failed", str(e))
+            return
+        self.lbl_input.config(text=Path(self.project.input_path).name)
+        self.lbl_output.config(text=Path(self.project.output_path).name)
+        self.var_all_audio.set(self.project.mutate_all_audio)
+        self.var_all_video.set(self.project.mutate_all_video)
+        self.var_audio_preset.set(self.project.all_audio_preset)
+        self.var_video_preset.set(self.project.all_video_preset)
+        # refresh lists
+        self.ar_list.delete(0, "end")
+        self.wave_canvas.clear_ranges()
+        for r in self.project.audio_ranges:
+            self.ar_list.insert("end",
+                                f"[{r.start:.2f} - {r.end:.2f}]  {r.preset}")
+            self.wave_canvas.add_range(
+                r.start, r.end,
+                {"subtle": "#3aa0ff", "balanced": "#ffb03a",
+                 "aggressive": "#ff4a4a"}[r.preset]
+            )
+        self.vr_list.delete(0, "end")
+        self.video_canvas.clear_regions()
+        for r in self.project.video_regions:
+            self.vr_list.insert("end",
+                                f"({r.x},{r.y}) {r.w}x{r.h}  {r.preset}")
+            self.video_canvas.add_region(
+                r.x, r.y, r.w, r.h,
+                {"subtle": "#3aa0ff", "balanced": "#ffb03a",
+                 "aggressive": "#ff4a4a"}[r.preset]
+            )
+        if self.project.input_path:
+            self._load_media()
+
+    # ---------- render -------------------------------------------
+
+    def render(self):
+        if not self.project.input_path:
+            messagebox.showinfo("no input", "open a video first")
+            return
+        if not self.project.output_path:
+            self.set_output()
+        self._sync_all_flags()
+
+        def worker():
+            try:
+                def cb(msg):
+                    self.status.config(text=msg)
+                    self.update_idletasks()
+                render_project(self.project, progress_cb=cb)
+                self.status.config(text="done ✓")
+                messagebox.showinfo("render", "render complete")
+            except Exception as e:
+                traceback.print_exc()
+                self.status.config(text=f"error: {e}")
+                messagebox.showerror("render failed", str(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+
+class PresetDialog(tk.Toplevel):
+    def __init__(self, master, current="balanced", label=""):
+        super().__init__(master)
+        self.title("preset")
+        self.configure(bg="#111")
+        self.result = None
+        tk.Label(self, text=label, bg="#111", fg="#ccc").pack(padx=12, pady=6)
+        self.var = tk.StringVar(value=current)
+        for k in PRESETS.keys():
+            tk.Radiobutton(self, text=k, value=k, variable=self.var,
+                           bg="#111", fg="#ddd", selectcolor="#222",
+                           activebackground="#111").pack(anchor="w", padx=18)
+        btns = tk.Frame(self, bg="#111")
+        btns.pack(pady=8)
+        tk.Button(btns, text="ok", command=self._ok,
+                  bg="#2b5fd9", fg="#fff", relief="flat").pack(side="left", padx=4)
+        tk.Button(btns, text="cancel", command=self.destroy,
+                  bg="#222", fg="#eee", relief="flat").pack(side="left", padx=4)
+        self.transient(master)
+        self.grab_set()
+
+    def _ok(self):
+        self.result = self.var.get()
+        self.destroy()
+
+
+# ---------------------------------------------------------------------------
+# entry
+# ---------------------------------------------------------------------------
+
+def main():
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        print("ffmpeg + ffprobe required on PATH")
+        sys.exit(1)
+    app = App()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
